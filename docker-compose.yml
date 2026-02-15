@@ -11,6 +11,11 @@ services:
       interval: 5s
       timeout: 3s
       retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'        # Hard limit: 1 CPU core
+          memory: 512M       # Hard limit: 512 MB RAM
 
   # 2. CELERY WORKER (The Brain)
   celery_worker:
@@ -29,3 +34,29 @@ services:
     volumes:
       # Mount code for hot-reloading
       - .:/app
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'        # Allow up to 2 CPU cores (1.0 might be too slow for agents)
+          memory: 1.6g       # Hard RAM limit
+        reservations:
+          memory: 1.2g
+
+  ollama:
+    image: ollama/ollama:latest
+    container_name: ollama
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama  # For model persistence
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]  # Enable GPU if available
+
+volumes:
+  ollama_data:

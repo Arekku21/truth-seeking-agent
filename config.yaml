@@ -14,7 +14,7 @@ agent:
   search_model_name: "qwen3-coder:latest"
 
   #local ollama server configuration
-  base_url: 'http://localhost:11434/v1'
+  base_url: 'http://172.27.240.1:11434/v1'
 
   base_system_prompt: |
     You are an experienced clinical dietitian and nutritionist specializing in personalized meal planning and recipe analysis. You have deep expertise in:

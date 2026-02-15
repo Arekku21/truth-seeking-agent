@@ -56,7 +56,7 @@ def main():
     meals_collection = database[os.getenv("MONGO_COLLECTION_NAME_Q_GEN")]
 
     #get the recipe records
-    cursor = meals_collection.find({}, {"_id": 1})
+    cursor = meals_collection.find({}, {"_id": 1}).limit(1).skip(0) #!limit and skip for testing, remove for production
 
     recipe_ids = [str(doc["_id"]) for doc in cursor]
 
