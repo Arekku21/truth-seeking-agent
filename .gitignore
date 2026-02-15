@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual Environments
+venv/
+hubitable_venv_1/
+env/
+.env
+
+# Environment Variables (NEVER UPLOAD THIS)
+.env
+config.yaml
+
+# IDEs
+.vscode/
+.idea/
+
+# Logs and Databases
+*.log
+*.sqlite3
+celerybeat-schedule
+
+#test folder
+test_files/
+config.yaml
