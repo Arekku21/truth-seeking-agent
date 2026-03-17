@@ -7,6 +7,33 @@
 - Move it to the root directory of the project (e.g., `/project-root/docker-compose.yml`).
 - Update any relative paths in the file (e.g., volume mounts or build contexts) to reflect the new location. For example, if a service builds from `./app`, change it to `./` if the app code is now at the root.
 
+
+Adjusted the folder structure to standard docker folder structure.
+
+```bash
+├── app
+│   ├── Dockerfile
+│   ├── celery_config.py
+│   ├── config.yaml
+│   ├── main.py
+│   ├── model_selector.py
+│   ├── ollama_fix.py
+│   ├── pipeline_func.py
+│   ├── query_generator.py
+│   ├── requirements.txt
+│   ├── search_agent.py
+│   ├── selector_tool_agent.py
+│   ├── user_details_creator_agent.py
+│   ├── utils
+│   │   ├── __init__.py
+│   │   ├── logging_helper.py
+│   │   └── mongo_db_helper.py
+│   └── worker_process.py
+├── docker-compose.yml
+├── instruct.readme.md
+└── readme.md
+```
+
 ### Step 2: Configure Dockerfile for Serving the FastAPI App
 - Create or update `Dockerfile` in the project root (if it doesn't exist, base it on Python 3.12-slim for efficiency).
 - Ensure it installs dependencies, copies the code, and runs the FastAPI app with Uvicorn (a production-ready ASGI server).

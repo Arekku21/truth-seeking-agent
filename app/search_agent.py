@@ -3,9 +3,11 @@ from dotenv import load_dotenv
 import os, string, re
 from typing import List, Set
 
-from pydantic_ai import Agent, RunContext, Tool,ModelRetry
+from pydantic_ai import Agent, RunContext, Tool
 from pydantic import BaseModel, Field
 from omegaconf import OmegaConf
+
+from pydantic_ai.exceptions import AgentRunError, ModelRetry
 
 from typing import List, Optional
 
@@ -63,27 +65,34 @@ def websearch_tool(ctx: RunContext[SearchQueryReasoningInput]) -> str:
     logger.info(f"[Tool] Agent requesting search for: '{search_query}' (Attempt {number_of_access+1})")
 
     #checker to stop the llm going on a loop
-    if number_of_access >= 1:
-        return(
-            "SYSTEM NOTICE: You have already searched once. "
-            "You are NOT allowed to search again. "
-            "Please compile your final answer using the results you already found."
-        )
+    if number_of_access >= 3:
+        logger.error("[Tool] LLM is looping. Force quitting.")
+        raise AgentRunError("Tool loop detected. Exiting to protect Celery worker.")
 
     #set the tool use counter to 1
     ctx.deps.tool_use_counter+=1
 
     #search logic
     try:
+
+        results = []
         
         #ddgs search function
-        results = list(DDGS().text(search_query, region='us-en', max_results=20, page=1, backend="auto"))
+        results = list(DDGS(timeout=20).text(search_query, region='us-en', max_results=20, page=1, backend="auto"))
+
+        # with DDGS(timeout=20) as ddgs:
+        #     # We iterate manually to prevent infinite generator loops
+        #     for idx, r in enumerate(ddgs.text(search_query, region='us-en', max_results=20, backend="auto")):
+        #         results.append(r)
+        #         # Hard stop at 15 results no matter what the library tries to do
+        #         if idx >= 15: 
+        #             break
 
         logger.info(f"[Tool] DDGS returned {len(results)} raw results.")
 
         if not results:
             logger.warning(f"[Tool] No results found for query: '{search_query}'")
-            return "No results found."
+            raise AgentRunError("Empty Result from DDGS")
         
         #loop and put the links in the dict for verification later
         formatted_results = []
@@ -117,13 +126,13 @@ def websearch_tool(ctx: RunContext[SearchQueryReasoningInput]) -> str:
         
         if not final_output.strip():
             logger.error("[Tool] Results existed but formatting failed (Empty Output).")
-            return "Search returned results but they were not readable."
+            raise AgentRunError("Search returned results but they were not readable.")
 
         return final_output
 
     except Exception as e:
         logger.error(f"[Tool] Critical Search Error: {e}", exc_info=True)
-        return f"Search Error occurred: {e}"
+        raise AgentRunError(f"Search API crashed or timed out: {e}")
     
 def search_agent_creator(config_file:OmegaConf) -> Agent:
 
@@ -136,7 +145,7 @@ def search_agent_creator(config_file:OmegaConf) -> Agent:
         deps_type=SearchQueryReasoningInput,
         tools=[websearch_tool],
         system_prompt=config_file.agent.base_system_prompt,
-        retries=5,
+        retries=2,
         output_type=SearchAgentOutput
     )
 

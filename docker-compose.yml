@@ -4,8 +4,9 @@ services:
     image: redis:alpine
     container_name: recipe_agent_redis
     restart: always
-    ports:
-      - "6379:6379"
+    command: redis-server --maxmemory 200mb --maxmemory-policy noeviction
+    expose:
+      - "6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -14,49 +15,91 @@ services:
     deploy:
       resources:
         limits:
-          cpus: '1.0'        # Hard limit: 1 CPU core
-          memory: 512M       # Hard limit: 512 MB RAM
+          cpus: '0.5'        # Hard limit: 1 CPU core
+          memory: 256m       # Hard limit: 512 MB RAM
 
-  # 2. CELERY WORKER (The Brain)
-  celery_worker:
-    build: .
-    container_name: recipe_agent_worker
+  # 2. FASTAPI SERVER (The API Gateway)
+  fastapi:
+    build: ./app
     restart: always
+    working_dir: /app
+    ports:
+      - "8000:8000"
     depends_on:
       redis:
         condition: service_healthy
     env_file:
       - .env
-    environment:
-      # Internal Docker Networking for Redis
-      CELERY_BROKER_URL: redis://redis:6379/0
-      CELERY_RESULT_BACKEND: redis://redis:6379/0
     volumes:
-      # Mount code for hot-reloading
-      - .:/app
+      - ./app:/app
     deploy:
       resources:
         limits:
-          cpus: '2.0'        # Allow up to 2 CPU cores (1.0 might be too slow for agents)
-          memory: 1.6g       # Hard RAM limit
+          cpus: '1.0'
+          memory: 500m
         reservations:
-          memory: 1.2g
+          memory: 300m
 
-  ollama:
-    image: ollama/ollama:latest
-    container_name: ollama
-    ports:
-      - "11434:11434"
+  # 3. CELERY WORKER (The Brain)
+  celery_worker:
+    build: ./app
+    restart: always
+    working_dir: /app
+    command: celery -A celery_config worker --loglevel=info --concurrency=8 #change concurrency to 1 whatever the number of CPU cores you want to allocate (1 is usually sufficient for agents testing)
+    depends_on:
+      redis:
+        condition: service_healthy
+    env_file:
+      - .env
     volumes:
-      - ollama_data:/root/.ollama  # For model persistence
-    restart: unless-stopped
+      # Mount code for hot-reloading
+      - ./app:/app
     deploy:
       resources:
+        limits:
+          cpus: '2.0'        
+          memory: 1g       
         reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]  # Enable GPU if available
+          memory: 512m
+  # 4. FLOWER (The Monitor)
+  flower:
+    build: ./app
+    working_dir: /app
+    command: celery -A celery_config flower --port=5555 --basic_auth=${FLOWER_USER}:${FLOWER_PASSWORD}
+    env_file:
+      - .env
+    volumes:
+      - ./app:/app
+    ports:
+      - "5555:5555"
+    depends_on:
+      - redis
+      - celery_worker
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256m
 
-volumes:
-  ollama_data:
+# ollama:
+#     image: ollama/ollama:latest
+#     container_name: ollama
+#     expose:
+#       - "11434"
+#     volumes:
+#       - ollama_data:/root/.ollama  # For model persistence
+#     restart: unless-stopped
+#     deploy:
+#       resources:
+#         limits:
+#           cpus: '1.0'
+#           memory: 2g         # Client Limit
+# # Uncomment the block below ONLY if the host server has a dedicated NVIDIA GPU
+# #        reservations:
+# #          devices:
+# #            - driver: nvidia
+# #              count: 1
+# #              capabilities: [gpu]
+
+# volumes:
+#   ollama_data:

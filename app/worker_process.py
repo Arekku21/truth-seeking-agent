@@ -4,6 +4,7 @@ from dotenv import load_dotenv
 import os
 from omegaconf import OmegaConf
 import datetime
+import asyncio
 
 from celery_config import app 
 from celery import Task
@@ -15,6 +16,7 @@ from celery import Celery
 from celery import shared_task, Task
 from celery.utils.log import get_task_logger
 from celery import Task
+from celery import chord, group, signature
 
 #import mongodb helper
 from utils.mongo_db_helper import connect_to_mongo_db
@@ -39,6 +41,9 @@ from selector_tool_agent import validator_tool
 #import the user details generator
 from user_details_creator_agent import UserDetailsInput, UserDetailsOutput, user_details_generator_agent
 
+import redis
+import json
+
 #!load environment variables
 load_dotenv()
 
@@ -61,17 +66,44 @@ mongo_db_client = connect_to_mongo_db(
     password=os.getenv("MONGODB_PASSWORD")
 )
 
+#! Connect to Redis
+redis_client = redis.Redis.from_url(os.getenv("CELERY_BROKER_URL", "redis://redis:6379/0"))
+
 logger.info("Worker process started!")
+
+#! helper function to update the pipeline status in Redis 
+def update_pipeline_status(recipe_id: str, stage: str, status: str, error_msg: str = None):
+    """Updates the live status in Redis"""
+    try:
+        redis_key = f"pipeline_status:{recipe_id}"
+        
+        status_data = {
+            "recipe_id": recipe_id,
+            "current_stage": stage,
+            "status": status,
+            "last_updated": datetime.datetime.now(datetime.timezone.utc).isoformat()
+        }
+        
+        if error_msg:
+            status_data["error_message"] = error_msg
+            
+        # Save to Redis as a JSON string, and set it to expire in 24 hours (86400 seconds)
+        redis_client.setex(redis_key, 86400, json.dumps(status_data))
+        
+    except Exception as e:
+        logger.error(f"Failed to update Redis status for {recipe_id}: {e}")
 
 #! task to create queries
 @app.task(bind=True)
 def query_genaration(self:Task,recipe_record_id:str,client_scenarios:list[str]) -> str:
 
     logger.info(f"\n\n[Start] Query generation for ID: {recipe_record_id}")
+    
+    update_pipeline_status(recipe_record_id, "1/4: Generating Queries", "PROCESSING")
 
     #!variable to return
     record_id = ""
-
+    
     #retrieve the record
     try:
         #selected database to query the recipes
@@ -107,8 +139,8 @@ def query_genaration(self:Task,recipe_record_id:str,client_scenarios:list[str]) 
 
         #run the agent
         result = query_agent.run_sync(
-            "Generate queries for the meal and client scenario",deps=combined_input, 
-            output_type=MealQueryOutput
+            "Generate queries for the meal and client scenario",
+            deps=combined_input
         )
 
         logger.info(f"Result created for record: {record.get("title")}")
@@ -125,6 +157,7 @@ def query_genaration(self:Task,recipe_record_id:str,client_scenarios:list[str]) 
             "related_recipe_id" : ObjectId(recipe_record_id),
             "generated_query" : result_clean.queries,
             "generated_query_reasoning" : result_clean.reasoning,
+            "scenarios": result_clean.scenarios,
             "created_at": datetime.datetime.now(datetime.timezone.utc)
         }
 
@@ -135,7 +168,31 @@ def query_genaration(self:Task,recipe_record_id:str,client_scenarios:list[str]) 
 
         record_id = str(result_db_insert.inserted_id)
 
+        #! --- NEW: TRIGGER STEP 2 (Fan-Out Search) & STEP 3 (Validator) ---
+        logger.info("[2] Building parallel search tasks...")
+        search_tasks = []
+        
+        for mapping in result_clean.mappings:
+            
+            # .s() creates a "Signature" (a task blueprint to run later)
+            search_tasks.append(
+                search_agent.s(
+                    recipe_record_id, 
+                    record_id, 
+                    mapping.query, 
+                    mapping.reasoning,
+                    mapping.scenario 
+                )
+            )
+            
+        # A Chord runs the list of search tasks, then automatically calls validator_agent
+        # .si() means "immutable signature" - it ensures Celery just passes the record_id 
+        # to the validator, ignoring the bulky return values of the searches.
+        logger.info("[2.5] Firing the Chord!")
+        chord(search_tasks)(validator_agent.si(record_id))
+
     except Exception as e:
+        update_pipeline_status(recipe_record_id, "1/4: Generating Queries", "FAILED", str(e))
         logger.error(f"[Error] Failed processing {recipe_record_id}: {e}", exc_info=True)
 
         raise e
@@ -146,12 +203,14 @@ def query_genaration(self:Task,recipe_record_id:str,client_scenarios:list[str]) 
 #! task to search the internet evidences
 @app.task(
     bind=True,
-    autoretry_for=(AgentRunError, ModelHTTPError, ValueError, AttributeError),
-    retry_kwargs={'max_retries': 3},
+    soft_time_limit=600,
+    time_limit=630,
+    max_retries=3
 )
-def search_agent(self:Task,recipe_record_id:str,recipe_qgen_record_id:str,search_query:str,reasoning:str) -> str:
+def search_agent(self:Task,recipe_record_id:str,recipe_qgen_record_id:str,search_query:str,reasoning:str,scenario: str) -> str:
 
     logger.info(f"\n\n[Start] Search evidences for ID: {recipe_qgen_record_id} with query: {search_query}")
+    update_pipeline_status(recipe_record_id, "2/4: Searching Evidences", "PROCESSING")
 
     #!variable to return
     record_id = ""
@@ -170,10 +229,26 @@ def search_agent(self:Task,recipe_record_id:str,recipe_qgen_record_id:str,search
 
         logger.info(f"Agent to search for record id: {recipe_qgen_record_id} with query: {search_query}")
 
-        result = agent.run_sync(
-            'Generate the list of 10 sources with reasoning and links for the given query and reasoning',
-            deps=search_input
-        )
+        # result = agent.run_sync(
+        #     'Generate the list of 10 sources with reasoning and links for the given query and reasoning',
+        #     deps=search_input
+        # )
+
+        async def fetch_from_llm():
+            return await agent.run(
+                'Generate the list of 10 sources with reasoning and links for the given query and reasoning',
+                deps=search_input
+            )
+
+        try:
+            # 2. Put a strict 4-minute (240 second) timer on Ollama. 
+            # If Ollama chokes, we hang up the phone.
+            result = asyncio.run(asyncio.wait_for(fetch_from_llm(), timeout=240.0))
+            
+        except (asyncio.TimeoutError, TimeoutError):
+            # 3. If it timed out, we force a retry or gracefully exit!
+            logger.error(f"[TIMEOUT] Ollama froze for over 4 minutes on query: {search_query}")
+            raise ValueError("Ollama Generation Timeout")
 
         logger.info(f"Agent search result for record id: {recipe_qgen_record_id} with query: {search_query}\n\n {result}")
 
@@ -181,17 +256,7 @@ def search_agent(self:Task,recipe_record_id:str,recipe_qgen_record_id:str,search
         result_clean = result.output
 
         if not result_clean.results:
-            logger.warning(f"Search Agent returned 0 valid links for query: '{search_query}'. Retrying task...")
-            
-            # 3. TRIGGER RETRY
-            # verify we haven't hit max_retries yet
-            if self.request.retries < self.max_retries:
-                # This throws a special exception that restarts the task
-                # countdown=2 waits 2 seconds before trying again
-                raise self.retry(exc=ValueError("Empty Result"), countdown=2)
-            else:
-                logger.error("Max retries reached. Giving up on this query.")
-                return "Failed: No valid links found after retries."
+            raise ValueError("Empty Result")
 
         #! add the item to the collection in mongodb
         database = mongo_db_client[os.getenv("MONGO_DB_NAME_SEARCH_AGENT_RESULTS")]
@@ -220,6 +285,7 @@ def search_agent(self:Task,recipe_record_id:str,recipe_qgen_record_id:str,search
             "source" : source_list,
             "source_link" : source_link_list,
             "reasoning" : reasoning_list,
+            "scenario": scenario,
             "source_content" : source_content_list,
             "search_query" : search_query,
             "created_at": datetime.datetime.now(datetime.timezone.utc)
@@ -232,20 +298,29 @@ def search_agent(self:Task,recipe_record_id:str,recipe_qgen_record_id:str,search
 
         record_id = str(result_db_insert.inserted_id)
 
-    except (UnexpectedModelBehavior, ValueError) as e:
-        # This catches:
-        # 1. UnexpectedModelBehavior: Agent failed validation 5 times (hallucination or format error)
-        # 2. ValueError: We manually raised this if list was empty
-        
-        logger.warning(f"[Retry Trigger] Agent failed validation or returned empty results: {e}. Retrying task in 2s...")
-        
-        # This forces Celery to retry the entire task
-        raise self.retry(exc=e, countdown=2)
+    except SoftTimeLimitExceeded as e:
+        if self.request.retries < self.max_retries:
+            logger.error(f"[TIMEOUT] Task froze for over 5 minutes on query: '{search_query}'. Forcing retry!")
+            raise self.retry(exc=e, countdown=5)
+        else:
+            logger.error(f"[GAVE UP] Exhausted all retries for timeout on: '{search_query}'. Skipping to save the Chord.")
+            return ""
+    
+    except (UnexpectedModelBehavior, ValueError,AgentRunError) as e:
+        if self.request.retries < self.max_retries:
+            logger.warning(f"[Retry Trigger] Agent failed validation or returned empty results: {e}. Retrying task in 2s...")
+            raise self.retry(exc=e, countdown=2)
+        else:
+            logger.error(f"[GAVE UP] Exhausted all retries for validation on: '{search_query}'. Skipping to save the Chord.")
+            return "" # Graceful exit
 
     except Exception as e:
-        logger.error(f"[Critical Error] Failed processing {recipe_qgen_record_id}: {e}", exc_info=True)
-
-        raise self.retry(exc=e)
+        if self.request.retries < self.max_retries:
+            logger.error(f"[Critical Error] Failed processing {recipe_qgen_record_id}: {e}", exc_info=True)
+            raise self.retry(exc=e, countdown=5)
+        else:
+            logger.error(f"[GAVE UP] Exhausted all retries for critical error on: '{search_query}'. Skipping to save the Chord.")
+            return ""
 
     return record_id
 
@@ -262,6 +337,14 @@ def validator_agent(self:Task,query_gen_result_id:str) -> str:
         #selected database to query the recipes
         database = mongo_db_client[os.getenv("MONGO_DB_NAME_VALIDATOR_TOOL_RESULTS")]
         search_agent_results_collection = database[os.getenv("MONGO_COLLECTION_NAME_SEARCH_AGENT_RESULTS")]
+
+        #get the recipe id to update the status in the pipeline
+        record = search_agent_results_collection.find_one({"related_qgen_id": ObjectId(query_gen_result_id)})
+        if record:
+            recipe_id_str = str(record.get("related_recipe_record_id"))
+            update_pipeline_status(recipe_id_str, "3/4: Validating evidences", "PROCESSING")
+        else:
+            raise ValueError(f"No records found for ID: {query_gen_result_id}")
 
         cursor = search_agent_results_collection.find({
             "related_qgen_id": ObjectId(query_gen_result_id)
@@ -307,7 +390,8 @@ def validator_agent(self:Task,query_gen_result_id:str) -> str:
                         "source_link":record.get("source_link")[idx],
                         "reasoning":record.get("reasoning")[idx],
                         "source_content":record.get("source_content")[idx],
-                        "search_query":q_key
+                        "search_query":q_key,
+                        "scenario": record.get("scenario", "Unknown Scenario")
                     }
 
                     dict_of_records[q_key].append(individual_record)
@@ -361,7 +445,10 @@ def validator_agent(self:Task,query_gen_result_id:str) -> str:
 
         #! Fill missing slots with UNIQUE spares
         # Recalculate missing slots based on unique final_selection
-        missing_slots = len(unique_s_queries) - len(final_selection)
+
+        TARGET_EVIDENCE_COUNT = 5
+
+        missing_slots = TARGET_EVIDENCE_COUNT - len(final_selection)
         
         if missing_slots > 0 and spare_pool:
             logger.info(f"Filling {missing_slots} missing slots from spare pool.")
@@ -380,6 +467,9 @@ def validator_agent(self:Task,query_gen_result_id:str) -> str:
                     final_selection.append(filler)
                     seen_urls.add(filler["source_link"])
                     filled_count += 1
+
+        if len(final_selection) < TARGET_EVIDENCE_COUNT:
+            logger.warning(f"Could only find {len(final_selection)} valid links total across all searches!")
 
         logger.info(f"Results validated. Attempting to add to database")
 
@@ -471,7 +561,12 @@ def validator_agent(self:Task,query_gen_result_id:str) -> str:
             logger.info(f"Duplicate record found with id: {str(existing_record["_id"])}")
             combined_input_id = str(existing_record["_id"])
 
+        #! --- NEW: TRIGGER STEP 4 (User Details) ---
+        logger.info("[4] Triggering User Details Agent...")
+        user_details_gen_agent_worker.delay(combined_input_id)
+
     except Exception as e:
+        update_pipeline_status(recipe_id_str, "3/4: Validating evidences", "FAILED", str(e))
         logger.error(f"[Error] Failed processing {query_gen_result_id}: {e}", exc_info=True)
 
         raise e
@@ -480,7 +575,7 @@ def validator_agent(self:Task,query_gen_result_id:str) -> str:
 
 
 #! task to create the user details based on the recipe, evidences and list of user scenarios
-@app.task(bind=True)
+@app.task(bind=True, max_retries=3)
 def user_details_gen_agent_worker(self:Task,combined_input_id:str) -> str:
 
     #! variable to return
@@ -511,6 +606,8 @@ def user_details_gen_agent_worker(self:Task,combined_input_id:str) -> str:
         recipe_collection = database[os.getenv("MONGO_COLLECTION_NAME_Q_GEN")]
         recipe_record = recipe_collection.find_one({"_id": ObjectId(recipe_id_to_query)})
 
+        update_pipeline_status(str(recipe_id_to_query), "4/4: Generating user details from evidences", "PROCESSING")
+
         #get the list of actual evidence not just the ids
         list_of_evidence_ids = record.get("evidence_id_list")
         evidence_collection = database[os.getenv("MONGO_COLLECTION_NAME_Q_GEN")]
@@ -540,10 +637,19 @@ def user_details_gen_agent_worker(self:Task,combined_input_id:str) -> str:
         logger.info(f"Agent to run for record: {combined_input_id}")
         
         #run the agent
-        result = user_details_agent.run_sync(
-            "Generate 5 user details for the meal, client scenario and evidences",
-            deps=user_details_input
-        )
+        try:
+            # run the agent
+            result = user_details_agent.run_sync(
+                "Generate 5 user details for the meal, client scenario and evidences",
+                deps=user_details_input
+            )
+        except AgentRunError as e:
+            if self.request.retries < self.max_retries:
+                logger.warning(f"Error: {e}")
+                raise self.retry(exc=e, countdown=5)
+            else:
+                logger.error(f"[GAVE UP] Failed to generate 3 times for record: {combined_input_id}")
+                raise e 
 
         logger.info(f"Result created for record: {combined_input_id}")
 
@@ -602,9 +708,32 @@ def user_details_gen_agent_worker(self:Task,combined_input_id:str) -> str:
         else:
             logger.info(f"[Info] Record found (ID: {combined_input_id}), but no changes were needed (data was identical).")
 
+        update_pipeline_status(str(recipe_id_to_query), "COMPLETE", "SUCCESS")
+
     except Exception as e:
+        update_pipeline_status(str(recipe_id_to_query), "4/4: Generating user details from evidences", "FAILED", str(e))
         logger.error(f"[Error] Failed processing {combined_input_id}: {e}", exc_info=True)
 
         raise e
 
     return combined_input_id
+
+
+#! main pipeline function to run the whole pipeline in sequence for each recipe id
+@app.task(bind=True)
+def run_recipe_agentic_context_pipeline(self:Task, recipe_id:str)->str:
+
+    logger.info(f"--- STARTING PIPELINE FOR RECIPE: {recipe_id} ---")
+    
+    try:
+        database = mongo_db_client[os.getenv("MONGO_DB_NAME_Q_GEN")]
+        user_scenario_collection = database[os.getenv("MONGO_COLLECTION_USER_SCENARIO")]
+        scenario_list = user_scenario_collection.distinct("user_scenario")
+
+        # Kick off Step 1! No .get() needed.
+        query_genaration.delay(recipe_id, scenario_list)
+        
+        return f"Pipeline successfully initiated for recipe {recipe_id}"
+    except Exception as e:
+        logger.error(f"[PIPELINE FAILED] to start for recipe {recipe_id}: {e}")
+        raise e

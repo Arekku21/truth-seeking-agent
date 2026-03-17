@@ -12,3 +12,6 @@ trafilatura==2.0.0
 rank-bm25==0.2.2
 numpy==2.2.6
 logfire==4.20.0
+flower==2.0.1
+fastapi>=0.115.2
+uvicorn>=0.32.0

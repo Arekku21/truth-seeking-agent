@@ -24,5 +24,14 @@ RUN pip install --no-cache-dir --default-timeout=1000 -r requirements.txt
 # Copy the rest of the application code
 COPY . .
 
-#run the celery
-CMD ["celery", "-A", "celery_config", "worker", "--loglevel=info", "--concurrency=8"]
+# #run the celery
+# CMD ["celery", "-A", "celery_config", "worker", "--loglevel=info", "--concurrency=1"]
+
+# --- CLIENT REQUIREMENT: Non-root user for security ---
+RUN useradd -m appuser
+# Give the user ownership of the /app directory so it can write logs/files if needed
+RUN chown -R appuser:appuser /app
+USER appuser
+
+# Run FastAPI with Uvicorn (production mode: no reload, multiple workers)
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "4"]
