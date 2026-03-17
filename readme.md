@@ -20,7 +20,7 @@ Built with **Python**, **Celery**, **Docker**, **MongoDB**, **Redis**, and **Pyd
 The entire project runs on docker and requires Redis to handle the Celery task queue. A `docker-compose.yml` file is provided.
 
 ```bash
-docker-compose up -d
+docker-compose up --build -d
 ```
 
 * **Redis**: Port `6379`
@@ -31,38 +31,37 @@ docker-compose up -d
 Create a `.env` file in the root directory. You must define the following variables for the agents and database connections to function:
 
 ```ini
-#mongodb configuration if local
-MONGODB_USERNAME=<username>
-MONGODB_PASSWORD=<password>
-MONGO_HOST=<ip address>
-
-#mongo atlas uri if using atlas
-MONGO_URI=<mongo_db_atlas_uri>
-
-#Path to your OmegaConf YAML
-CONFIG_FILE=<path to your config.yaml>
-
-#queue server
-REDIS_URL=<reddis url>
-
-#model provider and logfire for logging
-MODEL_PROVIDER_API_KEY=<groq_key/openai/etc>
-LOGFIRE_WRITE_TOKEN=<logfire write token>
+#! App configuration
 ENVIRONMENT=development
+CONFIG_FILE=./config.yaml
 
-#mongodb configuration
+#! Database configuration
+MONGODB_USERNAME=<your_mongo_username>
+MONGODB_PASSWORD=<your_mongo_password>
+MONGO_URI=mongodb+srv://<username>:<password>@cluster.mongodb.net/
+MONGO_HOST=<your_mongo_host_url>
+
+#! API Keys and Tokens
+TAVILY_API_KEY=<your_tavily_api_key>
+MODEL_PROVIDER_API_KEY=<your_model_provider_api_key>
+LOGFIRE_WRITE_TOKEN=<your_logfire_token>
+
+#! Infrastructure and Service URLs w/ default values
+REDIS_URL=redis://redis:6379/0
+CELERY_BROKER_URL=url_to_redis_broker
+CELERY_RESULT_BACKEND=redis://redis:6379/0
+FLOWER_USER=<your_flower_username>
+FLOWER_PASSWORD=<your_flower_password>
+
+#! MongoDB Collections and Database Names
 MONGO_DB_NAME_Q_GEN=recipe_crawler
 MONGO_COLLECTION_NAME_Q_GEN=meals
-
 MONGO_DB_NAME_Q_GEN_RESULTS=recipe_crawler
 MONGO_COLLECTION_NAME_Q_GEN_RESULTS=query_gen_collection
-
 MONGO_DB_NAME_SEARCH_AGENT_RESULTS=recipe_crawler
 MONGO_COLLECTION_NAME_SEARCH_AGENT_RESULTS=search_agent_collection
-
 MONGO_DB_NAME_VALIDATOR_TOOL_RESULTS=recipe_crawler
 MONGO_COLLECTION_NAME_VALIDATOR_TOOL_RESULTS=search_agent_collection
-
 MONGO_DB_NAME_VALIDATOR_TOOL_RESULTS=recipe_crawler
 MONGO_COLLECTION_EVIDENCE= evidence_collection
 MONGO_COLLECTION_USER_SCENARIO=user_scenarios_collection
@@ -135,6 +134,31 @@ python main.py
 
 * **Role**: Generates a specific user persona fit the fits the scenarios and evidences.
 * **Output**: Generates attributes like height, weight, age, and lifestyle based on the findings.
+
+# FastAPI Endpoints
+
+By default, FastAPI automatically generates interactive API documentation using Swagger UI. Once the Docker containers are running, the documentation is easily accessible at this link:
+**[http://localhost:8000/docs](http://localhost:8000/docs)**
+
+I have also saved the `json` file of the documentation with **[swagger_api_documentation.json](swagger_api_documentation.json)**. This also has been transformed into an MD file in **[swagger_api_documentation.md](swagger_api_documentation.md)**
+
+## Endpoints
+
+Here is a quick overview of the core endpoints exposed by the API:
+
+* **`POST /batch-process`**
+    * **Purpose:** Triggers the asynchronous multi-agent pipeline to process recipes and generate clinical scenarios via Celery.
+    * **Response:** Returns a Job ID/Recipe Id for tracking.
+
+* **`GET /api/v1/evidences`**
+    * **Purpose:** Retrieves the fully processed, validated  evidence record.
+    * **Features:** Supports pagination (`page`, `limit`), full-text keyword searching (`search`), and exact scenario filtering (`filter_scenario`) with the specified scenarios `Diabetes Type 1, Diabetes Type 2, on Weight Loss Program, on Weight Gain Program, Dialysis Patient, Hypertension Patient`.
+
+* **`GET /jobs/{job_id}`**
+    * **Purpose:** Polls the Celery backend to monitor the real-time execution status (e.g., PENDING, STARTED, SUCCESS) of a specific processing job.
+
+* **`GET /jobs`**
+    * **Purpose:** Returns all the jobs from the Celery backend to monitor the real-time execution status (e.g., PENDING, STARTED, SUCCESS) of a specific processing job.
 
 ## Troubleshooting & Notes
 
